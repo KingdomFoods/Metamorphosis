@@ -225,6 +225,11 @@ from indiamart import router as indiamart_router  # noqa: E402
 
 app.include_router(indiamart_router)
 
+# TailorTalk WhatsApp AI agent -> CRM lead (schema-tolerant; see tailortalk.py).
+from tailortalk import router as tailortalk_router  # noqa: E402
+
+app.include_router(tailortalk_router)
+
 
 # ============================================================================
 # Endpoints

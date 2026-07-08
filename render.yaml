@@ -1,0 +1,47 @@
+# Render Blueprint — Metamorphosis app (Zoho lead webhooks: Shoopy / WhatsApp / IndiaMART,
+# bankfeed, inventory tooling). FastAPI on uvicorn.
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> pick KingdomFoods/Metamorphosis.
+# Render reads this file, creates the service, and PROMPTS for the sync:false values
+# (nothing secret is stored in this public repo). Values come from your local
+# metamorphosis/.env — the .com Zoho ones.
+services:
+  - type: web
+    name: k24-metamorphosis
+    runtime: python
+    plan: starter                # free tier SLEEPS after 15 min idle -> cold-start misses
+                                  # webhooks; starter (~$7/mo) stays warm. Change if you prefer.
+    region: singapore            # closest Render region to India
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health     # open, unauthenticated -> good for Render health checks
+    autoDeploy: true             # redeploy on every push to main
+    envVars:
+      # --- non-secret config (baked in) -------------------------------------
+      - key: ZOHO_ACCOUNTS_URL
+        value: https://accounts.zoho.com      # .com DC — .in fails (invalid_client)
+      - key: ZOHO_API_BASE
+        value: https://www.zohoapis.com
+      - key: LIVE_MODE
+        value: "false"                         # SAFE MODE until item load + go-live (Phase E)
+      - key: INDIAMART_PULL_URL
+        value: https://mapi.indiamart.com/wservce/enquiry/listing/
+
+      # --- REQUIRED for Zoho auth (set these 4 at deploy; IndiaMART webhook needs only these)
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: ZOHO_ORG_ID
+        sync: false
+
+      # --- OPTIONAL: add in the Render dashboard when you enable each feature ---
+      # INDIAMART_WEBHOOK_KEY   -> secures /webhook/indiamart (?key=...)
+      # INDIAMART_API_KEY       -> Pull API / backfill
+      # WEBHOOK_SHARED_SECRET   -> /webhook/order, /production/*, /rm/* (X-Webhook-Secret)
+      # SHOOPY_WEBHOOK_TOKEN, SHOOPY_HMAC_SECRET   -> Shoopy webhook
+      # META_APP_SECRET, META_VERIFY_TOKEN         -> WhatsApp webhook
+      # DUMMY_SKU, ZOHO_SAFE_LOCATION_ID, ZOHO_PRIMARY_LOCATION_ID, ZOHO_GSTIN -> inventory/safe-mode
+      # ZOHO_HDFC_ACCOUNT_ID, ZOHO_SUSPENSE_ACCOUNT_ID, BANKFEED_STATE_FILE    -> bankfeed (if run here)
