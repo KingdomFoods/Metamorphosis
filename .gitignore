@@ -1,0 +1,20 @@
+# secrets / env (NEVER commit)
+.env
+.env.*
+*.env
+# Apps Script bundle — has hardcoded credentials; deploy via Google, not here
+sheet_sync/
+# runtime state & data dumps (business/bank data)
+*_raw.json
+bankfeed_state.json
+hdfc_statement_parsed.json
+demo_state.json
+demo_items_created.json
+demo_test_results.json
+item_load_raw.json
+location_verify_raw.json
+golive_readiness_raw.json
+# python
+__pycache__/
+*.pyc
+.pytest_cache/

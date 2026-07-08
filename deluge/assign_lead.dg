@@ -1,0 +1,60 @@
+/* ===========================================================================
+ * assign_lead.dg  —  Zoho CRM custom function (Deluge)
+ * Module: Leads  |  Trigger: Workflow rule "Assign Lead" on Create
+ * Argument: leadId (Long)  — map to "Lead Id"
+ *
+ * Round-robin assignment across the active sales team, with a score-aware
+ * override (Hot leads to the senior rep), then writes a Day-0 first-touch task.
+ *
+ * WHY a hardcoded owner list instead of zoho.crm.getRecords("users"):
+ *   reading users needs the ZohoCRM.users.READ scope, which our integration
+ *   OAuth grant intentionally does NOT carry. Deluge runs server-side as the
+ *   function owner, so it CAN see users — but to keep ownership explicit and
+ *   auditable for the sales lead, we configure the rotation here. Replace the
+ *   placeholder IDs below with real CRM user IDs (Setup > Users > open user >
+ *   the number in the URL), then Save.
+ * =========================================================================== */
+lead = zoho.crm.getRecordById("Leads", leadId);
+
+// --- sales team rotation (EDIT THESE IDs) ----------------------------------
+salesOwners = List();
+salesOwners.add("PUT_USER_ID_REP1");   // e.g. junior rep
+salesOwners.add("PUT_USER_ID_REP2");
+salesOwners.add("PUT_USER_ID_REP3");
+seniorRep = "PUT_USER_ID_SENIOR";       // gets Hot leads
+
+// --- pick owner ------------------------------------------------------------
+score = ifnull(lead.get("K24_Lead_Score"), 0).toLong();
+ownerId = "";
+if(score >= 70)
+{
+	ownerId = seniorRep;
+}
+else
+{
+	// round-robin keyed on the lead id so it is deterministic and stateless
+	idx = leadId % salesOwners.size();
+	ownerId = salesOwners.get(idx);
+}
+
+if(ownerId != "" && !ownerId.startsWith("PUT_USER_ID"))
+{
+	assignMap = Map();
+	assignMap.put("Owner", ownerId);
+	zoho.crm.updateRecord("Leads", leadId, assignMap);
+}
+
+// --- Day-0 first-touch task ------------------------------------------------
+task = Map();
+task.put("Subject", "First touch: " + ifnull(lead.get("Company"), ifnull(lead.get("Last_Name"), "New Lead")));
+task.put("Status", "Not Started");
+task.put("Priority", "High");
+task.put("Due_Date", zoho.currentdate.toString("yyyy-MM-dd"));
+task.put("$se_module", "Leads");
+task.put("What_Id", leadId);
+if(ownerId != "" && !ownerId.startsWith("PUT_USER_ID"))
+{
+	task.put("Owner", ownerId);
+}
+taskResp = zoho.crm.createRecord("Tasks", task);
+info taskResp;

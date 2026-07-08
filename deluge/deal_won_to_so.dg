@@ -1,0 +1,142 @@
+/* ===========================================================================
+ * deal_won_to_so.dg  —  Zoho CRM custom function (Deluge)
+ * Module: Deals  |  Trigger: Workflow rule "Deal Won -> Sales Order" on Edit
+ *                            (condition: Stage is "Closed Won")
+ * Argument: dealId (Long) -> map to "Deal Id" (${Deals.Deal Id})
+ *
+ * The CRM -> Inventory bridge. On a won Deal it creates a Sales Order in Zoho
+ * Books/Inventory (org 906246204), maps the Deal's products to Books items with
+ * per-line tax (the "per-line tax_id required" gotcha), writes the SO number back
+ * to the Deal, and posts a note. Intra-state (UP->UP) uses the item's intra tax.
+ *
+ * SAFE MODE (liveMode=false): LOG ONLY. Computes the full SO payload and logs it,
+ * creates NOTHING in Books. Flip liveMode=true at go-live (owner: Ops) once the
+ * Deal product subform + Books item links are confirmed.
+ *
+ * IDEMPOTENT: exits if the Deal already carries a Books SO number.
+ * PREREQ: a custom field "Books SO Number" (Books_SO_Number, single line) on Deals.
+ *   Until it exists, idempotency falls back to scanning the Deal description.
+ * =========================================================================== */
+
+liveMode = false;                 // SAFE MODE = log only, create nothing
+orgId    = "906246204";           // Kingdom Foods (.com DC)
+homeState = "Uttar Pradesh";      // intra-state if customer is in UP
+
+deal = zoho.crm.getRecordById("Deals", dealId);
+
+// --- idempotency: already bridged? -----------------------------------------
+existingSO = ifnull(deal.get("Books_SO_Number"), "");
+if(existingSO != "")
+{
+	info "Deal " + dealId + " already has SO " + existingSO + " - skipping.";
+	return;
+}
+
+// --- resolve the customer in Books -----------------------------------------
+acctName = ifnull(deal.get("Account_Name").get("name"), deal.get("Deal_Name"));
+booksCustomers = zoho.books.getRecords("contacts", orgId, { "company_name" : acctName });
+customerId = "";
+custList = ifnull(booksCustomers.get("contacts"), List());
+if(custList.size() > 0)
+{
+	customerId = custList.get(0).get("contact_id");
+}
+else
+{
+	// create a minimal Books customer (name only; enrich later in Books)
+	newCust = Map();
+	newCust.put("contact_name", acctName);
+	newCust.put("company_name", acctName);
+	newCust.put("contact_type", "customer");
+	created = zoho.books.createRecord("contacts", orgId, newCust);
+	customerId = created.get("contact").get("contact_id");
+	info "Created Books customer " + acctName + " -> " + customerId;
+}
+
+// --- build line items from the Deal's product subform ----------------------
+// K24 Deals carry products under the "Ordered_Items"/"Product_Details" subform.
+// Each line is matched to a Books item by SKU (product code) then by name, and the
+// item's own intra-state tax_id is applied per line (per-line tax_id gotcha).
+lineItems = List();
+products = ifnull(deal.get("Product_Details"), List());
+
+for each p in products
+{
+	prod = p.get("product");
+	sku  = ifnull(prod.get("Product_Code"), "");
+	pname = prod.get("name");
+	qty  = ifnull(p.get("quantity"), 1).toDecimal();
+
+	// find the Books item (SKU first, then name)
+	found = zoho.books.getRecords("items", orgId, { "sku" : sku });
+	itemList = ifnull(found.get("items"), List());
+	if(itemList.size() == 0)
+	{
+		found = zoho.books.getRecords("items", orgId, { "name" : pname });
+		itemList = ifnull(found.get("items"), List());
+	}
+
+	if(itemList.size() > 0)
+	{
+		it = itemList.get(0);
+		line = Map();
+		line.put("item_id", it.get("item_id"));
+		line.put("quantity", qty);
+		line.put("rate", ifnull(p.get("list_price"), it.get("rate")));
+		// per-line tax (gotcha #2): use the item's default intra-state tax
+		taxId = ifnull(it.get("tax_id"), it.get("intra_state_tax_id"));
+		if(taxId != null && taxId != "")
+		{
+			line.put("tax_id", taxId);
+		}
+		lineItems.add(line);
+	}
+	else
+	{
+		info "WARN: no Books item for SKU '" + sku + "' / name '" + pname + "' - line skipped.";
+	}
+}
+
+// fallback: no mapped products -> single description line from the Deal amount
+if(lineItems.size() == 0)
+{
+	amount = ifnull(deal.get("Amount"), 0).toDecimal();
+	line = Map();
+	line.put("name", "Order per Deal: " + deal.get("Deal_Name"));
+	line.put("description", "Auto-created from CRM Deal " + dealId + ". No product subform - book real items in Books.");
+	line.put("rate", amount);
+	line.put("quantity", 1);
+	lineItems.add(line);
+	info "WARN: Deal had no mapped products - created a single summary line for Rs." + amount;
+}
+
+// --- assemble the Sales Order payload --------------------------------------
+so = Map();
+so.put("customer_id", customerId);
+so.put("reference_number", "CRM-DEAL-" + dealId);
+so.put("line_items", lineItems);
+so.put("notes", "Auto-created from CRM Deal '" + deal.get("Deal_Name") + "' on win.");
+
+if(!liveMode)
+{
+	info "SAFE MODE - would create SO for " + acctName + " (" + lineItems.size() + " lines): " + so;
+	return;
+}
+
+// --- LIVE: create the SO, write back, post a note --------------------------
+resp = zoho.books.createRecord("salesorders", orgId, so);
+soRec = resp.get("salesorder");
+soNumber = soRec.get("salesorder_number");
+
+upd = Map();
+upd.put("Books_SO_Number", soNumber);
+zoho.crm.updateRecord("Deals", dealId, upd);
+
+note = Map();
+note.put("Note_Title", "Sales Order created");
+note.put("Note_Content", "Zoho Books SO " + soNumber + " created for " + acctName + " (" + lineItems.size() + " lines).");
+note.put("Parent_Id", dealId);
+note.put("se_module", "Deals");
+zoho.crm.createRecord("Notes", note);
+
+info "Created Books SO " + soNumber + " for Deal " + dealId;

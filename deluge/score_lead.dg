@@ -1,0 +1,111 @@
+/* ===========================================================================
+ * score_lead.dg  —  Zoho CRM custom function (Deluge)
+ * Module: Leads  |  Trigger: Workflow rule "Score Lead" on Create + Edit
+ * Argument: leadId (Long)  — map to "Lead Id" in the workflow function call
+ *
+ * Transparent, rule-based 0..100 score. Mirrors metamorphosis/crm_setup.py
+ * score_lead() exactly (that Python is the test oracle; this is the runtime).
+ * Writes K24_Lead_Score + a human-readable breakdown into Description.
+ *
+ * Native Zia predictive scoring needs >=75 converted leads before it can train,
+ * so this rule-based score runs now and Zia switches on later (see runbook).
+ * =========================================================================== */
+lead = zoho.crm.getRecordById("Leads", leadId);
+bd = Map();
+
+// --- business type ---------------------------------------------------------
+btWeights = Map();
+btWeights.put("Distributor", 30);
+btWeights.put("QSR", 25);
+btWeights.put("Hotel", 22);
+btWeights.put("Cloud Kitchen", 20);
+btWeights.put("Institutional", 20);
+btWeights.put("Restaurant", 18);
+btWeights.put("Caterer", 15);
+btype = ifnull(lead.get("Business_Type"), "");
+btScore = ifnull(btWeights.get(btype), 0);
+bd.put("business_type", btScore);
+
+// --- estimated order value -------------------------------------------------
+est = ifnull(lead.get("Estimated_Order_Value"), 0).toLong();
+ovScore = 0;
+if(est >= 500000)
+{
+	ovScore = 30;
+}
+else if(est >= 200000)
+{
+	ovScore = 22;
+}
+else if(est >= 50000)
+{
+	ovScore = 14;
+}
+else if(est > 0)
+{
+	ovScore = 6;
+}
+bd.put("order_value", ovScore);
+
+// --- city proximity to Sector 68 MMR --------------------------------------
+near = {"Noida", "Greater Noida", "Ghaziabad", "Delhi"};
+ncr = {"Gurgaon", "Gurugram", "Faridabad"};
+city = ifnull(lead.get("City"), "");
+cityScore = 0;
+if(near.contains(city))
+{
+	cityScore = 20;
+}
+else if(ncr.contains(city))
+{
+	cityScore = 12;
+}
+else if(city != "")
+{
+	cityScore = 4;
+}
+bd.put("city_proximity", cityScore);
+
+// --- completeness ----------------------------------------------------------
+comp = 0;
+if(ifnull(lead.get("Phone"), "") != "")
+{
+	comp = comp + 6;
+}
+if(ifnull(lead.get("Email"), "") != "")
+{
+	comp = comp + 6;
+}
+if(ifnull(lead.get("Product_Interest"), "") != "")
+{
+	comp = comp + 4;
+}
+if(ifnull(lead.get("Company"), "") != "")
+{
+	comp = comp + 4;
+}
+bd.put("completeness", comp);
+
+// --- total (capped 100) + label -------------------------------------------
+total = btScore + ovScore + cityScore + comp;
+if(total > 100)
+{
+	total = 100;
+}
+label = "Cold";
+if(total >= 70)
+{
+	label = "Hot";
+}
+else if(total >= 40)
+{
+	label = "Warm";
+}
+
+upd = Map();
+upd.put("K24_Lead_Score", total);
+breakdown = "Lead Score " + total + " (" + label + ") | bt=" + btScore + " value=" + ovScore + " city=" + cityScore + " complete=" + comp;
+existingDesc = ifnull(lead.get("Description"), "");
+upd.put("Description", breakdown + "\n" + existingDesc);
+updateResp = zoho.crm.updateRecord("Leads", leadId, upd);
+info updateResp;

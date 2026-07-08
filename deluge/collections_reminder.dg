@@ -1,0 +1,79 @@
+/* ===========================================================================
+ * collections_reminder.dg  —  Zoho Books/CRM scheduled custom function (Deluge)
+ * Schedule: daily (see RUNBOOK_Collections.md to wire the scheduled workflow).
+ *
+ * Buckets overdue receivables (7 / 15 / 30 days), flags any single customer with
+ * > Rs.10,00,000 overdue, and queues a reminder + a call task.
+ *
+ * SAFE MODE (liveMode=false): LOG ONLY. It computes and records buckets but sends
+ * NO customer email and creates NO outbound message. Flip liveMode=true (post
+ * go-live, owner: Finance) to actually send reminders.
+ * =========================================================================== */
+
+liveMode = false;                 // SAFE MODE = log only, zero customer sends
+bigOverdueThreshold = 1000000;    // Rs.10L flag
+
+today = zoho.currentdate;
+// Pull overdue invoices from Zoho Books (status = overdue). orgId is the connection default.
+overdue = zoho.books.getRecords("invoices", "ORG_ID", { "status" : "overdue" });
+
+bucket7 = List();
+bucket15 = List();
+bucket30 = List();
+flagged = List();
+
+for each inv in overdue
+{
+	dueDate = inv.get("due_date").toDate();
+	daysOverdue = dueDate.daysBetween(today);
+	balance = ifnull(inv.get("balance"), 0).toDecimal();
+	row = inv.get("customer_name") + " | " + inv.get("invoice_number") + " | Rs." + balance + " | " + daysOverdue + "d";
+
+	if(daysOverdue >= 30)
+	{
+		bucket30.add(row);
+	}
+	else if(daysOverdue >= 15)
+	{
+		bucket15.add(row);
+	}
+	else if(daysOverdue >= 7)
+	{
+		bucket7.add(row);
+	}
+
+	if(balance > bigOverdueThreshold)
+	{
+		flagged.add(row + "  [>Rs.10L OVERDUE]");
+	}
+
+	// --- reminder + call task (SAFE MODE skips the customer send) -----------
+	if(daysOverdue == 7 || daysOverdue == 15 || daysOverdue == 30)
+	{
+		if(liveMode)
+		{
+			// LIVE: email the customer the reminder (owner: Finance enables this)
+			sendmail
+			[
+				from : zoho.adminuserid
+				to : inv.get("email")
+				subject : "Payment reminder: invoice " + inv.get("invoice_number")
+				message : "Dear " + inv.get("customer_name") + ", invoice " + inv.get("invoice_number") + " of Rs." + balance + " is " + daysOverdue + " days overdue."
+			];
+		}
+		else
+		{
+			info "SAFE MODE - would remind " + inv.get("customer_name") + " (" + daysOverdue + "d, Rs." + balance + ")";
+		}
+		// internal call task always created (no external send)
+		task = Map();
+		task.put("Subject", "Collections call: " + inv.get("customer_name") + " (" + daysOverdue + "d overdue, Rs." + balance + ")");
+		task.put("Status", "Not Started");
+		task.put("Priority", if(balance > bigOverdueThreshold, "High", "Normal"));
+		task.put("Due_Date", today.toString("yyyy-MM-dd"));
+		zoho.crm.createRecord("Tasks", task);
+	}
+}
+
+info "Overdue buckets  7d=" + bucket7.size() + "  15d=" + bucket15.size() + "  30d=" + bucket30.size();
+info ">Rs.10L flagged: " + flagged;

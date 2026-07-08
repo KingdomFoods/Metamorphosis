@@ -1,0 +1,71 @@
+/* ===========================================================================
+ * production_workorder.dg  —  Zoho Creator / CRM Deluge
+ * Purpose: when a deal is won (or stock is insufficient for an order), raise a
+ *          production work order and, on completion, post finished goods IN.
+ *
+ * FINISHED-GOODS-IN ONLY (per K24 decision): we record RM batches consumed for
+ * TRACEABILITY but do NOT do raw-material consumption costing yet.
+ *
+ * SAFE MODE: while go-live is pending, point WORKORDER_SKU at the dummy SKU
+ * "K24-TEST-001" (set the var below). Flip to the real SKU only after go-live.
+ *
+ * This function is invoked two ways:
+ *   (a) Zoho Creator "Production Batch" form  -> on Submit (see RUNBOOK_Creator_Production.md)
+ *   (b) CRM workflow on Deal "Closed Won"     -> raises the work-order record
+ * It calls the app.py endpoint POST /production/stockin so all stock movement
+ * goes through the single safe-mode-guarded code path (no direct write here).
+ * =========================================================================== */
+
+// ---- config (EDIT) --------------------------------------------------------
+appBaseUrl   = "https://k24-metamorphosis.onrender.com";   // your Render URL
+webhookSecret = "PUT_WEBHOOK_SHARED_SECRET";                 // == WEBHOOK_SHARED_SECRET env
+liveMode      = false;                                       // keep false until go-live
+dummySku      = "K24-TEST-001";
+
+// ---- inputs (map from the Creator form / Deal) ----------------------------
+// batchId, sku, plannedQty, actualQty, mfgDate, expiryDate, qcStatus, rmBatches (list)
+
+effectiveSku = if(liveMode, sku, dummySku);
+
+// ---- build payload --------------------------------------------------------
+payload = Map();
+payload.put("batch_id", batchId);
+payload.put("sku", effectiveSku);
+payload.put("quantity", actualQty);
+payload.put("mfg_date", mfgDate);
+payload.put("expiry_date", expiryDate);
+payload.put("qc_status", qcStatus);
+
+headers = Map();
+headers.put("X-Webhook-Secret", webhookSecret);
+headers.put("Content-Type", "application/json");
+
+// ---- post finished goods IN (idempotent on batch_id in app.py) ------------
+response = invokeurl
+[
+	url : appBaseUrl + "/production/stockin"
+	type : POST
+	parameters : payload.toString()
+	headers : headers
+];
+info response;
+
+// ---- traceability log of RM batches consumed (NO costing) -----------------
+// rmBatches is a list of "RM_SKU:RM_BATCH:QTY" strings the floor team entered.
+for each rb in rmBatches
+{
+	parts = rb.toList(":");
+	issuePayload = Map();
+	issuePayload.put("issue_id", batchId + "-" + parts.get(0) + "-" + parts.get(1));
+	issuePayload.put("sku", if(liveMode, parts.get(0), dummySku));
+	issuePayload.put("quantity", parts.get(2).toDecimal());
+	issuePayload.put("batch_id", batchId);
+	issueResp = invokeurl
+	[
+		url : appBaseUrl + "/rm/issue"
+		type : POST
+		parameters : issuePayload.toString()
+		headers : headers
+	];
+	info issueResp;
+}
