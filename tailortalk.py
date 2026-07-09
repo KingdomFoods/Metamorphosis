@@ -3,23 +3,20 @@ tailortalk.py — TailorTalk WhatsApp AI agent -> Zoho CRM, as a mountable FastA
 
 TailorTalk fires an outbound webhook on lead events (First Message / On Warm / On Hot /
 On Converted / On Escalated / Every Message). This receives it and upserts a CRM Lead via
-the shared leads.upsert_lead path (dedup on mobile/email + K24_Lead_Score + idempotency),
-exactly like Shoopy / IndiaMART.
+the shared leads.upsert_lead path (dedup on mobile + K24_Lead_Score + idempotency), like
+Shoopy / IndiaMART.
 
-⚠️ SCHEMA NOTE: TailorTalk's guide (tailortalk.ai/guide/webhook/webhook) documents the
-setup + triggers but NOT the exact JSON field names. So the mapper is intentionally
-tolerant (tries many aliases) AND logs the raw payload. After you hit "View Sample
-Response" / "Test Trigger" in TailorTalk, share the real JSON and we tighten field names
-here (the _first(...) alias lists).
+Field mapping locked to TailorTalk's REAL payload (confirmed 2026-07-09):
+    { "webhook_trigger": "...", "event_type": "lead", "data": {
+        "lead_name": "...", "lead_contact": "<phone>", "lead_status": "cold|warm|hot",
+        "buyer_type": "...", "product_category": "...", "city": "...",
+        "chat_summary": "...", "lead_source": "whatsapp_ad", "id": "...",
+        "ad_data": {...}, "escalated": bool, ... } }
+Note: TailorTalk leads have NO email -> dedup is on mobile (lead_contact) only.
 
-Wire into app.py:
-    from tailortalk import router as tailortalk_router
-    app.include_router(tailortalk_router)
-
-Configure in TailorTalk: Agent page -> Webhook -> URL
-  https://<render-app>.onrender.com/webhook/tailortalk   (append ?key=<secret> if
-  TAILORTALK_WEBHOOK_KEY is set). Pick triggers: at minimum "First Message"; add
-  "On Warm/Hot/Converted" to keep the CRM lead's status fresh.
+Wire into app.py:  from tailortalk import router as tailortalk_router; app.include_router(tailortalk_router)
+Configure in TailorTalk: Agent -> Webhook -> URL
+  https://<render-app>.onrender.com/webhook/tailortalk?key=<TAILORTALK_WEBHOOK_KEY>
 
 Env: TAILORTALK_WEBHOOK_KEY (optional shared secret).
 """
@@ -39,62 +36,73 @@ log = structlog.get_logger("tailortalk")
 router = APIRouter(tags=["tailortalk"])
 
 WEBHOOK_KEY = os.getenv("TAILORTALK_WEBHOOK_KEY", "").strip()
-INBOUND_SOURCE = "WhatsApp"  # exact live Inbound_Source picklist value (verified)
+INBOUND_SOURCE = "WhatsApp"  # exact live Inbound_Source picklist value
 
-# TailorTalk trigger -> optional Pipeline_Stage nudge. Unknown/most events keep "New"
-# (never auto-advance on an event we can't fully trust). "converted" is the clear one.
-STAGE_BY_EVENT = {
-    "on converted": "Deal",
-    "converted": "Deal",
+# buyer_type -> Business_Type (a PICKLIST: Hotel/Restaurant/Cloud Kitchen/Caterer/QSR/
+# Distributor/Institutional). Unknown values are dropped (never sent) to avoid INVALID_DATA.
+_VALID_BUYER = {"Hotel", "Restaurant", "Cloud Kitchen", "Caterer", "QSR", "Distributor", "Institutional"}
+_BUYER_ALIASES = {
+    "hotel": "Hotel", "restaurant": "Restaurant", "cafe": "Restaurant",
+    "cloud kitchen": "Cloud Kitchen", "cloudkitchen": "Cloud Kitchen", "dark kitchen": "Cloud Kitchen",
+    "caterer": "Caterer", "catering": "Caterer", "qsr": "QSR", "quick service restaurant": "QSR",
+    "distributor": "Distributor", "distribution": "Distributor", "wholesaler": "Distributor",
+    "institutional": "Institutional", "institution": "Institutional",
 }
 
 
-def _first(d: dict[str, Any], *keys: str) -> Any:
-    """First non-empty value among keys/paths (TailorTalk field names are undocumented,
-    so we try many). Supports one level of nesting via 'a.b'."""
-    for k in keys:
-        if "." in k:
-            a, b = k.split(".", 1)
-            v = (d.get(a) or {}) if isinstance(d.get(a), dict) else {}
-            v = v.get(b) if isinstance(v, dict) else None
-        else:
-            v = d.get(k)
-        if v not in (None, "", [], {}):
-            return v
-    return None
+def _norm_buyer(v: Any) -> str | None:
+    if not v:
+        return None
+    s = str(v).strip()
+    return s if s in _VALID_BUYER else _BUYER_ALIASES.get(s.lower())
 
 
-def tailortalk_to_lead_kwargs(p: dict[str, Any]) -> dict[str, Any]:
-    """Map a TailorTalk webhook payload to leads.upsert_lead kwargs. Tolerant of unknown
-    field names; refine the alias lists once the real sample response is known."""
-    name = _first(p, "name", "lead_name", "contact_name", "customer_name", "sender_name",
-                  "full_name", "user_name", "contact.name", "lead.name") or "WhatsApp Lead"
-    parts = str(name).strip().split(" ", 1)
+# TailorTalk trigger -> optional Pipeline_Stage nudge. Only "converted" is unambiguous.
+_STAGE_BY_EVENT = {"on converted": "Deal", "converted": "Deal", "on_converted": "Deal"}
+
+
+def tailortalk_to_lead_kwargs(body: dict[str, Any]) -> dict[str, Any]:
+    """Map a full TailorTalk webhook body to leads.upsert_lead kwargs."""
+    d = body.get("data") if isinstance(body.get("data"), dict) else body
+    event = str(body.get("webhook_trigger") or body.get("event_type") or "").strip()
+
+    name = str(d.get("lead_name") or "WhatsApp Lead").strip()
+    parts = name.split(" ", 1)
     first = parts[0] if len(parts) > 1 else None
     last = parts[1] if len(parts) > 1 else parts[0]
 
-    phone = _first(p, "phone", "mobile", "whatsapp", "whatsapp_number", "wa_id", "from",
-                   "phone_number", "contact_number", "msisdn", "contact.phone", "lead.phone")
-    email = _first(p, "email", "email_address", "contact.email")
-    message = _first(p, "message", "text", "body", "query", "last_message", "content",
-                     "message_body", "user_message") or ""
-    event = str(_first(p, "event", "trigger", "type", "event_type", "status", "stage") or "message")
-    city = _first(p, "city", "location", "contact.city")
+    # rich note — everything TailorTalk gives that isn't a first-class field
+    bits = []
+    if d.get("chat_summary"):
+        bits.append("Summary: " + str(d["chat_summary"]))
+    for label, key in (("Buyer", "buyer_type"), ("Status", "lead_status"), ("Supply", "supply_mode"),
+                       ("Qty", "quantity"), ("Timeline", "timeline"), ("Purchase", "purchase_type"),
+                       ("Use", "use_case"), ("Followups", "total_followups")):
+        v = d.get(key)
+        if v not in (None, "", 0):
+            bits.append(f"{label}: {v}")
+    if d.get("lead_source"):
+        bits.append("Src: " + str(d["lead_source"]))
+    ad = d.get("ad_data") or {}
+    if isinstance(ad, dict) and ad.get("title"):
+        bits.append("Ad: " + str(ad["title"]))
+    if d.get("escalated"):
+        bits.append("ESCALATED")
+    note = ("TailorTalk WhatsApp" + (f" [{event}]" if event else "") + " | " + " | ".join(bits)).strip(" |")
 
-    note = f"TailorTalk WhatsApp ({event}): {message}".strip()
-    kw = {
-        "external_id": (lambda i: f"TT:{i}" if i else None)(
-            _first(p, "id", "lead_id", "conversation_id", "session_id", "contact_id", "wa_id")),
+    kw: dict[str, Any] = {
+        "external_id": (lambda i: f"TT:{i}" if i else None)(d.get("id") or d.get("lead_id")),
         "first_name": first,
         "last_name": last,
-        "mobile": phone,
-        "email": email,
-        "city": city,
+        "mobile": d.get("lead_contact") or d.get("phone") or d.get("mobile"),  # leadsvc normalises
+        "city": d.get("city"),
+        "product_interest": (str(d["product_category"])[:255] if d.get("product_category") else None),
+        "business_type": _norm_buyer(d.get("buyer_type")),
         "note": note,
     }
-    stage = STAGE_BY_EVENT.get(event.strip().lower())
-    if stage:
-        kw["stage"] = stage
+    st = _STAGE_BY_EVENT.get(event.lower())
+    if st:
+        kw["stage"] = st
     return kw
 
 
@@ -110,31 +118,25 @@ async def tailortalk_webhook(request: Request, key: str | None = Query(default=N
         form = await request.form()
         body = dict(form)
 
-    # log the raw payload — this is how we discover TailorTalk's real field names
     log.info("tailortalk_webhook", raw=(raw[:2000].decode("utf-8", "replace") if raw else ""))
-
-    # payload may be a single object or {"data": {...}} / {"lead": {...}}
-    obj = body
-    if isinstance(body, dict):
-        obj = body.get("data") or body.get("lead") or body.get("payload") or body
-    if not isinstance(obj, dict):
+    if not isinstance(body, dict):
         return {"status": "ignored", "reason": "non-object payload"}
 
-    kw = tailortalk_to_lead_kwargs(obj)
-    if not (kw.get("mobile") or kw.get("email")):
-        # no contact key yet — accept (don't error the webhook) but flag for schema fix
-        log.warning("tailortalk_no_contact_key", keys=list(obj.keys()))
-        return {"status": "ok", "note": "no phone/email found — check field mapping vs sample response"}
+    kw = tailortalk_to_lead_kwargs(body)
+    if not kw.get("mobile"):
+        log.warning("tailortalk_no_contact", data_keys=list((body.get("data") or body).keys()))
+        return {"status": "ok", "note": "no lead_contact/phone in payload — nothing to create"}
 
     z = ZohoClient()
     async with z:
-        result = await leadsvc.upsert_lead(z, inbound_source=INBOUND_SOURCE, raw_payload=obj, **kw)
+        result = await leadsvc.upsert_lead(z, inbound_source=INBOUND_SOURCE, raw_payload=body, **kw)
+    log.info("tailortalk_lead", action=result.get("action"), lead_id=result.get("lead_id"), score=result.get("score"))
     return {"status": "ok", **result}
 
 
 @router.get("/webhook/tailortalk")
 async def tailortalk_verify(request: Request) -> Response:
-    """Some providers GET the URL to verify it / echo a challenge. Echo it defensively."""
+    """Some providers GET the URL to verify / echo a challenge. Echo it defensively."""
     challenge = request.query_params.get("challenge") or request.query_params.get("hub.challenge")
     return Response(content=challenge or "ok", media_type="text/plain")
 

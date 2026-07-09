@@ -155,6 +155,7 @@ async def upsert_lead(
     note: str | None = None,
     raw_payload: Any | None = None,
     stage: str | None = None,
+    business_type: str | None = None,
 ) -> dict[str, Any]:
     """Create or enrich a Lead. Idempotent on external_id, dedupes on mobile then email.
 
@@ -167,7 +168,7 @@ async def upsert_lead(
 
     # Build the score from the same oracle the Deluge uses.
     scored = score_lead({
-        "Business_Type": "",
+        "Business_Type": business_type or "",
         "Estimated_Order_Value": est_value or 0,
         "City": city or "",
         "Phone": mobile or "",
@@ -201,6 +202,8 @@ async def upsert_lead(
             upd["Product_Interest"] = product_interest
         if sku_interest and not existing.get("SKU_Interest"):
             upd["SKU_Interest"] = sku_interest
+        if business_type and not existing.get("Business_Type"):
+            upd["Business_Type"] = business_type
         if mobile and not existing.get("Mobile"):
             upd["Mobile"] = mobile
         if email and not existing.get("Email"):
@@ -225,6 +228,8 @@ async def upsert_lead(
         payload["First_Name"] = first_name[:40]
     if company:
         payload["Company"] = company
+    if business_type:
+        payload["Business_Type"] = business_type
     if mobile:
         payload["Mobile"] = mobile
         payload["Phone"] = mobile
