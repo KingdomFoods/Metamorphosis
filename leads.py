@@ -25,7 +25,7 @@ from zoho_client import ZohoClient
 log = structlog.get_logger("leads")
 
 MODULE = "Leads"
-_PAYLOAD_MAX = 32000  # Source_Payload is a 'large' textarea; keep well under the limit
+_PAYLOAD_MAX = 30000  # Source_Payload max is 32000; margin so long chat_history doesn't 400
 
 # In-process dedupe cache: maps external_id / mobile / email -> lead_id. Zoho's search index
 # lags a few seconds after a write, so two webhooks arriving in quick succession (or a test) can
