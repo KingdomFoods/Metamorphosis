@@ -29,9 +29,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 import structlog
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 import leads as leadsvc
@@ -59,8 +60,14 @@ SAFE_TAX_EXEMPTION_CODE = "NONTAXABLE"
 # --- lead-source integration secrets (env-only) --------------------------------
 SHOOPY_WEBHOOK_TOKEN = os.getenv("SHOOPY_WEBHOOK_TOKEN", "")   # Bearer token Shoopy sends
 SHOOPY_HMAC_SECRET = os.getenv("SHOOPY_HMAC_SECRET", "")       # optional: X-Shoopy-Signature over raw body
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")            # WhatsApp Cloud-API fallback only
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")        # WhatsApp Cloud-API fallback only
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")            # verifies X-Hub-Signature-256 on inbound
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")        # echoed back on Meta's GET handshake
+# Outbound: when WHATSAPP_TOKEN + WHATSAPP_PHONE_NUMBER_ID are set, the number runs the CONVERSATIONAL
+# Ria bot (salesiq_agent) and replies over WhatsApp via the Graph API. Without them, the /webhook/whatsapp
+# POST falls back to the legacy behaviour (create a lead from the first message, no reply).
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")                       # permanent System-User token (secret)
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")   # sender phone-number id (Meta)
+WHATSAPP_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v21.0")
 
 # Module-level singleton client (opened on startup, closed on shutdown).
 _z: ZohoClient | None = None
@@ -234,6 +241,7 @@ app.include_router(tailortalk_router)
 # grounded conversational qualifier. Router loads even without the anthropic SDK / ANTHROPIC_API_KEY
 # (health-only + scripted fallback), so it can never take down the other webhooks. See salesiq_agent.py.
 from salesiq_agent import router as salesiq_router  # noqa: E402
+from salesiq_agent import handle_message as salesiq_handle  # noqa: E402
 
 app.include_router(salesiq_router)
 
@@ -587,8 +595,47 @@ async def shoopy_health() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SOURCE 3 — WHATSAPP (Cloud API webhook FALLBACK; prefer the native Zoho channel)
+# SOURCE 3 — WHATSAPP (Meta Cloud API)
+#   • WHATSAPP_TOKEN + WHATSAPP_PHONE_NUMBER_ID set → CONVERSATIONAL Ria bot (replies via Graph API)
+#   • otherwise                                      → legacy lead-capture (create lead, no reply)
 # ---------------------------------------------------------------------------
+_wa_seen_ids: set[str] = set()  # in-memory dedupe of Meta message ids (Meta retries on non-200)
+
+
+async def _wa_send(to: str, text: str) -> None:
+    """Send a WhatsApp text reply via the Meta Graph API. Best-effort — logs on failure."""
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
+        log.warning("wa_send_skipped_no_token", to=to)
+        return
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            r = await c.post(
+                url,
+                headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+                json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text[:4096]}},
+            )
+        if r.status_code >= 300:
+            log.error("wa_send_failed", to=to, status=r.status_code, body=r.text[:300])
+        else:
+            log.info("wa_send_ok", to=to)
+    except Exception as exc:  # noqa: BLE001
+        log.error("wa_send_error", to=to, error=str(exc))
+
+
+async def _wa_process_conversation(wa_id: str, text: str, name: str) -> None:
+    """Run the Ria brain for one inbound WhatsApp text and reply over WhatsApp. Runs in the
+    background so the webhook can 200 inside Meta's 5s window (avoids retries / double replies)."""
+    try:
+        result = await salesiq_handle(wa_id, text, {"phone": wa_id, "name": name, "channel": "whatsapp"})
+        reply = (result or {}).get("reply")
+        if reply:
+            await _wa_send(wa_id, reply)
+    except Exception as exc:  # noqa: BLE001
+        log.error("wa_conversation_error", wa_id=wa_id, error=str(exc))
+        await _wa_send(wa_id, "Sorry, thodi technical dikkat aa gayi 🙏 Hamari team aapse jaldi connect karegi.")
+
+
 @app.get("/webhook/whatsapp")
 async def whatsapp_verify(request: Request) -> Response:
     """Meta verification handshake — echo hub.challenge when the verify token matches."""
@@ -599,7 +646,7 @@ async def whatsapp_verify(request: Request) -> Response:
 
 
 @app.post("/webhook/whatsapp")
-async def whatsapp_webhook(request: Request) -> dict[str, Any]:
+async def whatsapp_webhook(request: Request, background: BackgroundTasks) -> dict[str, Any]:
     raw = await request.body()
     if not META_APP_SECRET:
         raise HTTPException(status_code=503, detail="META_APP_SECRET not configured")
@@ -613,28 +660,46 @@ async def whatsapp_webhook(request: Request) -> dict[str, Any]:
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="invalid JSON body")
     _mark_event("whatsapp")
-    log.info("whatsapp_webhook", raw_len=len(raw))
-    z = _z_client()
 
-    processed = []
+    conversational = bool(WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID)
+    log.info("whatsapp_webhook", raw_len=len(raw), mode="conversational" if conversational else "legacy")
+    z = None if conversational else _z_client()
+
+    processed = 0
     for entry in payload.get("entry", []) or []:
         for change in entry.get("changes", []) or []:
             value = change.get("value", {}) or {}
             contacts = {c.get("wa_id"): (c.get("profile") or {}).get("name") for c in value.get("contacts", []) or []}
             for msg in value.get("messages", []) or []:
+                msg_id = msg.get("id") or ""
+                if msg_id and msg_id in _wa_seen_ids:
+                    continue  # Meta retry — already handled
+                if msg_id:
+                    _wa_seen_ids.add(msg_id)
+                    if len(_wa_seen_ids) > 5000:  # bound memory
+                        _wa_seen_ids.clear()
+                        _wa_seen_ids.add(msg_id)
                 wa_id = msg.get("from")
-                text = ((msg.get("text") or {}).get("body")) or f"[{msg.get('type')}]"
+                # Only text messages carry a conversation. Others (image/audio/location/etc.) get a nudge.
+                if msg.get("type") != "text":
+                    if conversational and wa_id:
+                        background.add_task(_wa_send, wa_id, "Abhi main sirf text messages padh sakti hoon 🙏 Aap type karke bhejein.")
+                    continue
+                text = (msg.get("text") or {}).get("body") or ""
                 name = contacts.get(wa_id) or "WhatsApp Lead"
-                parts = str(name).strip().split(" ", 1)
-                result = await leadsvc.upsert_lead(
-                    z,
-                    inbound_source="WhatsApp",
-                    external_id=msg.get("id"),  # idempotent on message id
-                    first_name=parts[0] if len(parts) > 1 else None,
-                    last_name=parts[1] if len(parts) > 1 else parts[0],
-                    mobile=wa_id,
-                    note=f"WhatsApp inbound: {text[:300]}",
-                    raw_payload=msg,
-                )
-                processed.append(result)
-    return {"status": "ok", "processed": len(processed), "results": processed}
+                if conversational:
+                    background.add_task(_wa_process_conversation, wa_id, text, name)
+                else:
+                    parts = str(name).strip().split(" ", 1)
+                    await leadsvc.upsert_lead(
+                        z,
+                        inbound_source="WhatsApp",
+                        external_id=msg_id,  # idempotent on message id
+                        first_name=parts[0] if len(parts) > 1 else None,
+                        last_name=parts[1] if len(parts) > 1 else parts[0],
+                        mobile=wa_id,
+                        note=f"WhatsApp inbound: {text[:300]}",
+                        raw_payload=msg,
+                    )
+                processed += 1
+    return {"status": "ok", "processed": processed, "mode": "conversational" if conversational else "legacy"}

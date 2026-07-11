@@ -50,6 +50,18 @@ services:
       - key: CLIQ_WEBHOOK_URL
         sync: false
 
+      # --- WhatsApp (Meta Cloud API) — set ALL FOUR to run the Ria bot on a WhatsApp number ---
+      # With these set, POST /webhook/whatsapp runs the conversational bot and REPLIES over WhatsApp.
+      # Without WHATSAPP_TOKEN/WHATSAPP_PHONE_NUMBER_ID it falls back to lead-capture only (no reply).
+      - key: META_APP_SECRET            # Meta App -> Settings -> Basic -> App Secret (verifies inbound sig)
+        sync: false
+      - key: META_VERIFY_TOKEN          # any long random string you pick; echoed on Meta's GET handshake
+        sync: false
+      - key: WHATSAPP_TOKEN             # permanent System-User access token (whatsapp_business_messaging)
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID   # Meta -> WhatsApp -> API Setup -> Phone number ID
+        sync: false
+
       # --- OPTIONAL: add in the Render dashboard when you enable each feature ---
       # REDIS_URL               -> shared conversation state across workers/instances (else per-process
       #                            memory; fine for the single starter worker). SALESIQ_STATE_TTL (sec).
