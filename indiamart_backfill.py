@@ -51,12 +51,12 @@ async def run(days: int, window_days: int, gap: int, dry_run: bool) -> dict:
     totals = {"windows": len(windows), "fetched": 0, "created": 0, "updated": 0, "noop": 0, "error": 0}
     z = ZohoClient()
     async with z:
-        for i, (w_start, w_end) in enumerate(windows):
+        i, attempts, MAX_ATTEMPTS = 0, 0, 3
+        while i < len(windows):
+            w_start, w_end = windows[i]
             code, leads = await im.fetch_window(w_start, w_end)
-            if code == 429:
-                log.warning("backfill_throttled", window=i, hint="increase --gap; window skipped")
-                totals["error"] += 1
-            else:
+            done = False
+            if code == 200:
                 totals["fetched"] += len(leads)
                 for enq in leads:
                     if dry_run:
@@ -67,11 +67,23 @@ async def run(days: int, window_days: int, gap: int, dry_run: bool) -> dict:
                     except Exception as exc:  # noqa: BLE001
                         log.error("backfill_lead_failed", error=str(exc))
                         totals["error"] += 1
-            log.info("backfill_window_done", window=f"{i+1}/{len(windows)}",
-                     range=f"{w_start:%d-%b} to {w_end:%d-%b}", fetched=len(leads))
-            if i < len(windows) - 1 and gap > 0:
-                log.info("backfill_throttle_wait", seconds=gap)
-                await asyncio.sleep(gap)  # respect the 5-min Pull-API limit
+                log.info("backfill_window_done", window=f"{i+1}/{len(windows)}",
+                         range=f"{w_start:%d-%b} to {w_end:%d-%b}", fetched=len(leads))
+                i += 1
+                attempts = 0
+                done = (i >= len(windows))
+            else:
+                # non-200 = throttle (~1 req/5 min) -> wait the gap and RETRY the same window
+                attempts += 1
+                log.warning("backfill_retry", window=i + 1, attempt=attempts, code=code)
+                if attempts >= MAX_ATTEMPTS:
+                    totals["error"] += 1
+                    log.error("backfill_window_gave_up", window=i + 1, range=f"{w_start:%d-%b} to {w_end:%d-%b}")
+                    i += 1
+                    attempts = 0
+                    done = (i >= len(windows))
+            if not done and gap > 0:
+                await asyncio.sleep(gap)  # spacing before the next API call (retry or next window)  # respect the 5-min Pull-API limit
     log.info("backfill_complete", **totals)
     return totals
 

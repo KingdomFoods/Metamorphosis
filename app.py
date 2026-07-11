@@ -230,6 +230,13 @@ from tailortalk import router as tailortalk_router  # noqa: E402
 
 app.include_router(tailortalk_router)
 
+# SalesIQ WhatsApp AGENT (Claude-powered) -> CRM lead. Replaces TailorTalk with a controllable,
+# grounded conversational qualifier. Router loads even without the anthropic SDK / ANTHROPIC_API_KEY
+# (health-only + scripted fallback), so it can never take down the other webhooks. See salesiq_agent.py.
+from salesiq_agent import router as salesiq_router  # noqa: E402
+
+app.include_router(salesiq_router)
+
 
 # ============================================================================
 # Endpoints

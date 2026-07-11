@@ -41,10 +41,12 @@ router = APIRouter(tags=["indiamart"])
 
 INDIAMART_API_KEY = os.getenv("INDIAMART_API_KEY", "").strip()
 INDIAMART_WEBHOOK_KEY = os.getenv("INDIAMART_WEBHOOK_KEY", "").strip()
-PULL_URL = os.getenv("INDIAMART_PULL_URL", "https://mapi.indiamart.com/wservce/enquiry/listing/").strip()
+# v2 Pull API (the legacy /enquiry/listing/ v1 endpoint 503s "overload"). v2 caps each
+# request to a 7-day window and expects date-only start/end.
+PULL_URL = os.getenv("INDIAMART_PULL_URL", "https://mapi.indiamart.com/wservce/crm/crmListing/v2/").strip()
 
 INBOUND_SOURCE = "IndiaMart"  # exact live picklist value (verified)
-_IM_TIME_FMT = "%d-%b-%Y %H:%M:%S"  # IndiaMART's required time format, e.g. 08-Jul-2026 14:30:00
+_IM_TIME_FMT = "%d-%b-%Y"  # v2 date format, e.g. 08-Jul-2026 (max 7-day range per call)
 
 
 def _first(d: dict[str, Any], *keys: str) -> Any:

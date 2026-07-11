@@ -1,20 +1,21 @@
-# secrets / env (NEVER commit)
+# ── Secrets — NEVER commit (repo may be public) ──
 .env
 .env.*
-*.env
-# Apps Script bundle — has hardcoded credentials; deploy via Google, not here
+!.env.example          # the placeholder template is safe to commit
+*.bak
+*.pem
+*.key
+
+# Apps Script source holds hardcoded Zoho + Cliq secrets AND doesn't run on Render
+# (it's pasted into the Google Sheet editor). Keep it out of the deployed repo entirely.
 sheet_sync/
-# runtime state & data dumps (business/bank data)
-*_raw.json
+
+# State / data files that may carry live values
 bankfeed_state.json
-hdfc_statement_parsed.json
 demo_state.json
-demo_items_created.json
-demo_test_results.json
-item_load_raw.json
-location_verify_raw.json
-golive_readiness_raw.json
-# python
+*_state.json
+
+# Python
 __pycache__/
 *.pyc
 .pytest_cache/

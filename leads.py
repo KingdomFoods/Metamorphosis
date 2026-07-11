@@ -22,6 +22,13 @@ import structlog
 from crm_setup import score_label, score_lead
 from zoho_client import ZohoClient
 
+# Optional rep-assignment hook (Assigned_Rep + Cliq notify). Imported defensively so
+# leads.py still works if the module is absent (e.g. trimmed test bundle).
+try:
+    import rep_assignment
+except Exception:  # noqa: BLE001
+    rep_assignment = None  # type: ignore[assignment]
+
 log = structlog.get_logger("leads")
 
 MODULE = "Leads"
@@ -255,4 +262,18 @@ async def upsert_lead(
     lead_id = rec["details"]["id"]
     _cache_put(lead_id, external_id, mobile, email)
     log.info("lead_created", lead_id=lead_id, source=inbound_source, score=scored["score"], label=score_label(scored["score"]))
-    return {"action": "created", "lead_id": lead_id, "matched_by": "none", "score": scored["score"]}
+
+    # Assign to a rep (balanced round-robin) + notify via Cliq. Best-effort: a failure here
+    # must never fail lead ingestion — the lead is already safely created above.
+    assigned_rep: str | None = None
+    if rep_assignment is not None:
+        try:
+            assigned_rep = await rep_assignment.assign_and_notify(z, lead_id, {
+                "name": f"{first_name} {last_name}".strip() if first_name else last_name,
+                "company": company, "phone": mobile, "product": product_interest,
+                "score": scored["score"], "city": city, "source": inbound_source,
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("assign_notify_failed", lead_id=lead_id, error=str(exc))
+
+    return {"action": "created", "lead_id": lead_id, "matched_by": "none", "score": scored["score"], "assigned_rep": assigned_rep}

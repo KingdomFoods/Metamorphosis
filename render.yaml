@@ -26,6 +26,10 @@ services:
         value: "false"                         # SAFE MODE until item load + go-live (Phase E)
       - key: INDIAMART_PULL_URL
         value: https://mapi.indiamart.com/wservce/enquiry/listing/
+      # SalesIQ WhatsApp agent model — Haiku 4.5 only (cheapest tier; proven sufficient). Baked in
+      # so a deploy can never silently fall back to a pricier model. See salesiq_agent.py.
+      - key: AGENT_MODEL
+        value: claude-haiku-4-5
 
       # --- REQUIRED for Zoho auth (set these 4 at deploy; IndiaMART webhook needs only these)
       - key: ZOHO_CLIENT_ID
@@ -37,7 +41,19 @@ services:
       - key: ZOHO_ORG_ID
         sync: false
 
+      # --- REQUIRED for the SalesIQ Claude agent (set at deploy; secret, not stored in repo) ---
+      # Without ANTHROPIC_API_KEY the /webhook/salesiq route still loads but serves a scripted
+      # fallback (degraded=true) instead of the real Ria conversation — so the bot is NOT live.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Cliq alert on every bot-qualified lead (rep_assignment.assign_and_notify). Holds a zapikey.
+      - key: CLIQ_WEBHOOK_URL
+        sync: false
+
       # --- OPTIONAL: add in the Render dashboard when you enable each feature ---
+      # REDIS_URL               -> shared conversation state across workers/instances (else per-process
+      #                            memory; fine for the single starter worker). SALESIQ_STATE_TTL (sec).
+      # SALESIQ_WEBHOOK_KEY     -> secures /webhook/salesiq (?key=...)
       # INDIAMART_WEBHOOK_KEY   -> secures /webhook/indiamart (?key=...)
       # INDIAMART_API_KEY       -> Pull API / backfill
       # WEBHOOK_SHARED_SECRET   -> /webhook/order, /production/*, /rm/* (X-Webhook-Secret)
