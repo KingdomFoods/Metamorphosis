@@ -34,6 +34,7 @@ import structlog
 from fastapi import APIRouter, HTTPException, Query, Request
 
 import leads as leadsvc
+import wa_outbound
 from zoho_client import ZohoClient
 
 log = structlog.get_logger("indiamart")
@@ -41,6 +42,11 @@ router = APIRouter(tags=["indiamart"])
 
 INDIAMART_API_KEY = os.getenv("INDIAMART_API_KEY", "").strip()
 INDIAMART_WEBHOOK_KEY = os.getenv("INDIAMART_WEBHOOK_KEY", "").strip()
+# Auto-WhatsApp on every NEW IndiaMART lead. Business-initiated => must be an APPROVED template
+# (see wa_outbound). Dormant until both the template name AND the WhatsApp creds are set, so this
+# never fires half-configured. Template body should take {{1}}=buyer name, {{2}}=product/enquiry.
+INDIAMART_WELCOME_TEMPLATE = os.getenv("INDIAMART_WELCOME_TEMPLATE", "").strip()
+INDIAMART_WELCOME_LANG = os.getenv("INDIAMART_WELCOME_LANG", "en").strip()
 # v2 Pull API (the legacy /enquiry/listing/ v1 endpoint 503s "overload"). v2 caps each
 # request to a 7-day window and expects date-only start/end.
 PULL_URL = os.getenv("INDIAMART_PULL_URL", "https://mapi.indiamart.com/wservce/crm/crmListing/v2/").strip()
@@ -89,10 +95,34 @@ def indiamart_to_lead_kwargs(im: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _send_welcome(kw: dict[str, Any]) -> dict[str, Any] | None:
+    """Fire the approved WhatsApp welcome template to a brand-new lead. Best-effort: any failure is
+    logged and swallowed so it can never break lead ingestion. No-op unless fully configured."""
+    if not (INDIAMART_WELCOME_TEMPLATE and wa_outbound.configured()):
+        return None
+    mobile = kw.get("mobile")
+    if not mobile:
+        return None
+    name = kw.get("first_name") or kw.get("last_name") or "there"
+    product = kw.get("product_interest") or "your enquiry"
+    res = await wa_outbound.send_template(mobile, INDIAMART_WELCOME_TEMPLATE, INDIAMART_WELCOME_LANG, [name, product])
+    log.info("indiamart_welcome_wa", to=mobile, ok=res.get("ok"), error=res.get("error"))
+    return res
+
+
 async def _ingest_one(z: ZohoClient, im: dict[str, Any]) -> dict[str, Any]:
     kw = indiamart_to_lead_kwargs(im)
     result = await leadsvc.upsert_lead(z, inbound_source=INBOUND_SOURCE, raw_payload=im, **kw)
-    return {"enquiry_id": _first(im, "UNIQUE_QUERY_ID", "QUERY_ID"), **result}
+    # Auto-welcome ONLY genuinely new leads — upsert_lead is idempotent, so a re-ingested enquiry
+    # returns action != "created" and we never double-message.
+    welcomed = None
+    if result.get("action") == "created":
+        try:
+            wres = await _send_welcome(kw)
+            welcomed = bool(wres and wres.get("ok"))
+        except Exception as exc:  # noqa: BLE001 — messaging must never fail ingestion
+            log.error("indiamart_welcome_failed", error=str(exc))
+    return {"enquiry_id": _first(im, "UNIQUE_QUERY_ID", "QUERY_ID"), "whatsapp_welcomed": welcomed, **result}
 
 
 def _extract_leads(body: Any) -> list[dict[str, Any]]:
