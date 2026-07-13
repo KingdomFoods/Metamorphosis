@@ -1,0 +1,171 @@
+/*
+ * salesiq_lead_create.dg — SalesIQ (WhatsApp/website chat) -> Zoho CRM Lead.
+ *
+ * Deploy as a SalesIQ "Bot -> Action -> Custom Function" (or a CRM-side webhook function
+ * SalesIQ calls when a chat is qualified/ends). Replaces the TailorTalk -> Render path with
+ * an in-Zoho function — no middleware, runs on Zoho's servers (needs no external OAuth token).
+ *
+ * Mirrors leads.upsert_lead discipline so SalesIQ leads behave like every other source:
+ *   - dedupe on phone (E.164 +91…) so it NEVER duplicates the existing WhatsApp leads
+ *   - Inbound_Source = "WhatsApp"  (exact live picklist value)
+ *   - Assigned_Rep round-robin, BALANCED by current open-lead count (reps aren't CRM users,
+ *     so we tag the custom text field, never Owner) — same field the API sources set
+ *   - Business_Type is a PICKLIST: only send a valid value. "Other"/unknown -> omit (sending
+ *     "Other" makes Zoho reject the whole record with INVALID_DATA — verified against the live
+ *     picklist 2026-07-10: Hotel/Restaurant/Cloud Kitchen/Caterer/QSR/Distributor/Institutional).
+ *
+ * INPUT: pass these from the bot's collected answers (adapt getter calls to your SalesIQ setup):
+ *   visitor_name, visitor_phone, visitor_company, visitor_city,
+ *   ans_business_type, ans_product_interest, ans_volume (kg/month, a number), chat_transcript
+ *   chat_id (optional — SalesIQ conversation id, stored as Source_Record_Id for idempotency)
+ *
+ * Scoring: left to the CRM-side score workflow (RUNBOOK_CRM_Workflows) which fires on Lead
+ * create for ALL sources — one scoring source of truth (deluge/score_lead.dg). Until that's
+ * deployed, lead_score_backfill.py / rep_assignment sweeps cover it.
+ *
+ * ─── FIXED 2026-07-13 (this file would not save, and mis-assigned every lead) ─────────────
+ *   1. SYNTAX — `x = if(cond) a else b;` is not Deluge and the editor rejects the whole script.
+ *      Deluge's conditional is the three-arg FUNCTION `if(cond, a, b)`. Was on 2 lines.
+ *   2. ROUND-ROBIN WAS DEAD — zoho.crm.searchRecords returns at most 200 records per call, and
+ *      it returns a plain list with no total. Both reps are now WELL over 200 open leads (401 /
+ *      400 after the Manoj reassignment), so both counts came back as exactly 200, tied, and the
+ *      strict `<` comparison left best_rep on its initialiser: EVERY WhatsApp lead went to Rashi.
+ *      Now paged (see count_open_leads) so the counts are real.
+ *   3. ans_volume (kg/month) was written to Estimated_Order_Value — a CURRENCY field that feeds
+ *      lead scoring, so a 500 kg/month answer scored as a ₹500 deal. It now goes to
+ *      Monthly_Volume_Kg (verified live: exists, integer — hence the toLong()).
+ *   4. updateRecord no longer gets an "id" key inside the field map (Zoho rejects it there).
+ *   5. An existing lead assigned to a REMOVED rep is now re-picked instead of kept.
+ *   6. Company now falls back to the person's name (as Code.gs does) so the lead never lands with
+ *      a blank company. NOTE: verified live 2026-07-13 — on THIS org only Last_Name is mandatory,
+ *      Company is optional, so a blank company was never rejecting the record. This is a
+ *      consistency fix, not a lost-lead fix.
+ *   NOTE: Deluge only runs inside Zoho — this file cannot be executed or tested from the repo.
+ *   Paste it into the SalesIQ/CRM function editor; the editor compiles on save, which is the
+ *   check for bug 1.
+ */
+
+// ── 0. inputs (replace the literals with the bot's captured values) ─────────────
+name        = input.visitor_name;
+phone_raw   = input.visitor_phone;
+company     = input.visitor_company;
+city        = input.visitor_city;
+btype_raw   = input.ans_business_type;
+product     = input.ans_product_interest;
+volume      = input.ans_volume;            // kg/month, from the volume-bucket mapping
+transcript  = input.chat_transcript;
+chat_id     = input.chat_id;               // optional
+
+// ── 1. normalise phone to +91XXXXXXXXXX (dedupe key) ────────────────────────────
+digits = phone_raw.replaceAll("[^0-9]", "", false);
+if(digits.startsWith("0")) { digits = digits.removeFirstOccurence("0"); }
+if(digits.length() == 10) { mobile = "+91" + digits; }
+else if(digits.length() == 12 && digits.startsWith("91")) { mobile = "+" + digits; }
+else { mobile = "+" + digits; }
+
+// ── 2. Business_Type: only pass a VALID picklist value (else omit — never "Other") ─
+valid_btypes = {"Hotel","Restaurant","Cloud Kitchen","Caterer","QSR","Distributor","Institutional"};
+btype = "";
+if(btype_raw != null)
+{
+    for each v in valid_btypes
+    {
+        if(v.equalsIgnoreCase(btype_raw.trim())) { btype = v; }
+    }
+}
+
+// ── 3. dedupe: does a lead with this phone already exist? ────────────────────────
+existing = zoho.crm.searchRecords("Leads", "(Phone:equals:" + mobile + ")");
+lead_id = "";
+prev_rep = "";
+if(existing != null && existing.size() > 0)
+{
+    lead_id = existing.get(0).get("id");
+    if(existing.get(0).get("Assigned_Rep") != null) { prev_rep = existing.get(0).get("Assigned_Rep"); }
+}
+
+// ── 4. balanced round-robin Assigned_Rep ────────────────────────────────────────
+// Keep in sync with rep_assignment.REPS and Code.gs CONFIG.REP_TABS. Manoj removed 2026-07-13.
+reps = {"Rashi","Prashant"};
+
+// An existing lead keeps its rep — but only if that rep still works the pipeline. A lead left on
+// a removed rep (e.g. Manoj) would otherwise be re-stamped with his name on every chat and never
+// be worked by anyone.
+assigned_rep = "";
+open_counts = Map();   // stays empty on the keep-existing-rep path (below), which is fine — it is
+                       // only used for the log line.
+if(prev_rep != "" && reps.contains(prev_rep))
+{
+    assigned_rep = prev_rep;   // returning visitor: no counting needed, so we skip ~10 API calls
+}
+else
+{
+    // Count each rep's OPEN leads. searchRecords hands back a LIST capped at per_page (max 200)
+    // with no total, so `hits.size()` silently saturates at 200 and any two reps above that TIE —
+    // which is exactly what killed this round-robin. Page until a short page comes back; that is
+    // the only way to get a true count out of Deluge without the COQL API.
+    // 5 pages x 200 = 1000 open leads/rep before it saturates again; log loudly if it does.
+    for each r in reps
+    {
+        crit = "((Assigned_Rep:equals:" + r + ")and(Pipeline_Stage:not_equal:Deal)and(Pipeline_Stage:not_equal:Not-Applicable))";
+        total = 0;
+        saturated = true;
+        for each pg in {1,2,3,4,5}
+        {
+            batch = zoho.crm.searchRecords("Leads", crit, pg, 200);
+            bn = 0;
+            if(batch != null) { bn = batch.size(); }
+            total = total + bn;
+            if(bn < 200) { saturated = false; break; }
+        }
+        if(saturated) { info "WARN rep " + r + " has 1000+ open leads — count capped, balance may drift."; }
+        open_counts.put(r, total);
+    }
+
+    best_rep = reps.get(0);
+    best_count = -1;
+    for each r in reps
+    {
+        cnt = open_counts.get(r);
+        if(best_count == -1 || cnt < best_count) { best_count = cnt; best_rep = r; }
+    }
+    assigned_rep = best_rep;
+}
+
+// ── 5. build the lead map (only set fields we actually have) ─────────────────────
+// Last_Name is the one system-mandatory field (verified live) — never let it be blank. Company is
+// optional here, but fall back anyway so the lead (and the rep's sheet row) is never nameless.
+person = if(name == null || name == "", "WhatsApp Lead", name);
+org    = if(company == null || company == "", person, company);
+
+lead = Map();
+lead.put("Last_Name", person);
+lead.put("Company", org);
+lead.put("Phone", mobile);
+lead.put("Inbound_Source", "WhatsApp");
+lead.put("Pipeline_Stage", "New");
+lead.put("Assigned_Rep", assigned_rep);
+if(city != null && city != "") { lead.put("City", city); }
+if(btype != "") { lead.put("Business_Type", btype); }
+if(product != null && product != "") { lead.put("Product_Interest", product); }
+// kg/month -> Monthly_Volume_Kg. NOT Estimated_Order_Value: that is a CURRENCY field and it feeds
+// lead scoring, so a 500 kg answer was scoring as a ₹500 deal. The field is an INTEGER (verified
+// live), so round — a decimal bucket like 12.5 would be rejected as INVALID_DATA.
+if(volume != null) { lead.put("Monthly_Volume_Kg", volume.toLong()); }
+if(chat_id != null && chat_id != "") { lead.put("Source_Record_Id", "SIQ:" + chat_id); }
+if(transcript != null && transcript != "") { lead.put("Description", "SalesIQ WhatsApp chat:\n" + transcript); }
+
+// ── 6. create or enrich ─────────────────────────────────────────────────────────
+if(lead_id != "")
+{
+    resp = zoho.crm.updateRecord("Leads", lead_id, lead);
+    info "SalesIQ lead UPDATED " + lead_id + " -> " + assigned_rep + " (open: " + open_counts + ")";
+}
+else
+{
+    resp = zoho.crm.createRecord("Leads", lead);
+    info "SalesIQ lead CREATED -> " + assigned_rep + " (open: " + open_counts + ") : " + resp;
+}
+// TODO(optional): POST the same alert to CLIQ_WEBHOOK_URL here via invokeurl for parity with
+// the Render path — SalesIQ can also just @-notify the assigned rep's Cliq directly.
+return resp;
