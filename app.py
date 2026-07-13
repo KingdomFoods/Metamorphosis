@@ -242,6 +242,7 @@ app.include_router(tailortalk_router)
 # (health-only + scripted fallback), so it can never take down the other webhooks. See salesiq_agent.py.
 from salesiq_agent import router as salesiq_router  # noqa: E402
 from salesiq_agent import handle_message as salesiq_handle  # noqa: E402
+from salesiq_agent import MODEL as SALESIQ_MODEL  # noqa: E402  (reported by /webhook/whatsapp/health)
 
 app.include_router(salesiq_router)
 
@@ -643,6 +644,33 @@ async def whatsapp_verify(request: Request) -> Response:
     if params.get("hub.mode") == "subscribe" and META_VERIFY_TOKEN and params.get("hub.verify_token") == META_VERIFY_TOKEN:
         return Response(content=params.get("hub.challenge", ""), media_type="text/plain")
     raise HTTPException(status_code=403, detail="verification failed")
+
+
+@app.get("/webhook/whatsapp/health")
+async def whatsapp_health() -> dict[str, Any]:
+    """Which WhatsApp config is actually live on this instance. Booleans only — never the secrets.
+
+    The single question this answers: is the bot in `conversational` mode (Ria replies) or `legacy`
+    (leads get created, Ria stays silent)? That flips purely on WHATSAPP_TOKEN + PHONE_NUMBER_ID
+    being present, and there is otherwise no way to tell from outside without a valid Meta
+    signature. `mode: legacy` with everything else green is the classic "deployed but mute" trap.
+    """
+    conversational = bool(WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID)
+    return {
+        "ok": True,
+        "source": "whatsapp",
+        "mode": "conversational" if conversational else "legacy",
+        "whatsapp_token_set": bool(WHATSAPP_TOKEN),
+        "whatsapp_phone_number_id_set": bool(WHATSAPP_PHONE_NUMBER_ID),
+        "meta_verify_token_set": bool(META_VERIFY_TOKEN),
+        "meta_app_secret_set": bool(META_APP_SECRET),
+        # A real Meta app secret is 32 hex chars. A different length means a placeholder was
+        # deployed, and EVERY inbound message will be rejected 401 on the signature check.
+        "meta_app_secret_len_ok": len(META_APP_SECRET) == 32 if META_APP_SECRET else False,
+        "graph_version": WHATSAPP_GRAPH_VERSION,
+        "agent_model": SALESIQ_MODEL,
+        "last_event_at": _last_event.get("whatsapp"),
+    }
 
 
 @app.post("/webhook/whatsapp")

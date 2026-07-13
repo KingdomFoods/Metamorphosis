@@ -1,9 +1,9 @@
 """
 rep_assignment.py — assign CRM Leads to reps who are NOT licensed Zoho users, + notify them.
 
-The constraint (KNOWN_ISSUES #4): Rashi / Prashant / Manoj are not CRM users, so leads
-cannot be OWNED by them (Owner must be a licensed user). We sidestep the license cost with
-a plain custom text field `Assigned_Rep`:
+The constraint (KNOWN_ISSUES #4): Rashi / Prashant are not CRM users, so leads cannot be
+OWNED by them (Owner must be a licensed user). We sidestep the license cost with a plain
+custom text field `Assigned_Rep`:
 
   Layer 1  ensure_assigned_rep_field()  create the Assigned_Rep field (idempotent)
   Layer 1  assign_rep()                 round-robin BALANCED by current open-lead count
@@ -20,15 +20,24 @@ we count via /Leads/search (works under ZohoCRM.modules.ALL, which leads.py alre
 seed once per process, then keep an in-process tally so consecutive assignments stay balanced
 despite Zoho's search-index lag.
 
+Manoj was removed from the pipeline on 2026-07-13. Three places assign reps and ALL THREE had
+to drop him or leads would keep flowing to a rep who no longer works them:
+    1. REPS below                     (IndiaMART / Shoopy / any upsert_lead source)
+    2. sheet_sync/Code.gs REP_TABS    (sheet-entered leads)
+    3. deluge/salesiq_lead_create.dg  (WhatsApp / SalesIQ — runs inside Zoho, not here)
+His existing leads are NOT deleted — `--reassign-from Manoj` moves them to the active reps.
+
 CLI:
     python rep_assignment.py                 # ensure field + print live per-rep counts (read-only)
     python rep_assignment.py --backfill       # assign every currently-UNASSIGNED lead (no notify)
     python rep_assignment.py --backfill --notify   # ...and fire a Cliq alert per lead (spammy!)
+    python rep_assignment.py --reassign-from Manoj          # DRY RUN — show the plan, change nothing
+    python rep_assignment.py --reassign-from Manoj --apply  # actually rewrite Assigned_Rep
 
 Env:
     CLIQ_WEBHOOK_URL      Zoho Cliq incoming-webhook URL (channel -> integrations). If unset,
                           notification is skipped (assignment still happens).
-    REP_PHONE_RASHI / REP_PHONE_PRASHANT / REP_PHONE_MANOJ   optional, shown in the alert.
+    REP_PHONE_RASHI / REP_PHONE_PRASHANT   optional, shown in the alert.
     ASSIGNMENT_ENABLED    "0" to disable the upsert_lead hook (default on).
 """
 from __future__ import annotations
@@ -47,7 +56,7 @@ log = structlog.get_logger("rep_assignment")
 
 MODULE = "Leads"
 ASSIGNED_REP_FIELD = "Assigned_Rep"
-REPS: list[str] = ["Rashi", "Prashant", "Manoj"]
+REPS: list[str] = ["Rashi", "Prashant"]   # Manoj removed 2026-07-13 -> round-robin is now 50/50
 
 # Stages that mean the lead is CLOSED (don't count toward a rep's live workload).
 CLOSED_STAGES = {"Deal", "Not-Applicable"}
@@ -55,7 +64,6 @@ CLOSED_STAGES = {"Deal", "Not-Applicable"}
 REP_PHONES: dict[str, str] = {
     "Rashi": os.getenv("REP_PHONE_RASHI", "").strip(),
     "Prashant": os.getenv("REP_PHONE_PRASHANT", "").strip(),
-    "Manoj": os.getenv("REP_PHONE_MANOJ", "").strip(),
 }
 CLIQ_WEBHOOK_URL = os.getenv("CLIQ_WEBHOOK_URL", "").strip()
 ASSIGNMENT_ENABLED = os.getenv("ASSIGNMENT_ENABLED", "1").strip() not in ("0", "false", "no", "")
@@ -84,34 +92,40 @@ async def ensure_assigned_rep_field(z: ZohoClient) -> str:
 
 
 # ── Layer 1: balanced round-robin ──────────────────────────────────────────────
-async def _count_open_leads(z: ZohoClient, rep: str) -> int:
-    """Count open (non-closed) leads currently assigned to `rep`, via /Leads/search.
+async def _search_by_rep(z: ZohoClient, rep: str, fields: str = "id,Pipeline_Stage") -> list[dict[str, Any]]:
+    """Every lead whose Assigned_Rep == rep, via /Leads/search.
 
     Search returns 204/empty for zero matches (the client yields {} -> data []). At current
-    volume (<200/rep) this is a single page; paginate defensively anyway.
+    volume (<300/rep) this is a single page; paginate defensively anyway. A failed page returns
+    what we have rather than raising — callers treat a short list as "at least these".
     """
-    total, page = 0, 1
+    out: list[dict[str, Any]] = []
+    page = 1
     while True:
         try:
             resp = await z.get(
                 z.crm(f"/{MODULE}/search"),
                 params={
                     "criteria": f"({ASSIGNED_REP_FIELD}:equals:{rep})",
-                    "fields": "id,Pipeline_Stage",
+                    "fields": fields,
                     "page": page,
                     "per_page": 200,
                 },
                 with_org=False,
             )
         except ZohoError as exc:
-            log.warning("count_search_failed", rep=rep, error=str(exc))
-            return total
-        data = resp.get("data") or []
-        total += sum(1 for r in data if (r.get("Pipeline_Stage") not in CLOSED_STAGES))
+            log.warning("rep_search_failed", rep=rep, page=page, error=str(exc))
+            return out
+        out.extend(resp.get("data") or [])
         if not (resp.get("info") or {}).get("more_records"):
-            break
+            return out
         page += 1
-    return total
+
+
+async def _count_open_leads(z: ZohoClient, rep: str) -> int:
+    """Count open (non-closed) leads currently assigned to `rep`."""
+    leads = await _search_by_rep(z, rep)
+    return sum(1 for r in leads if r.get("Pipeline_Stage") not in CLOSED_STAGES)
 
 
 async def _ensure_seed(z: ZohoClient) -> None:
@@ -209,6 +223,62 @@ async def assign_and_notify(z: ZohoClient, lead_id: str, lead: dict[str, Any], *
     return rep
 
 
+# ── Offboarding: move a departing rep's leads to the active ones ────────────────
+async def reassign_from(z: ZohoClient, departing: str, *, apply: bool = False) -> dict[str, Any]:
+    """Move every lead with Assigned_Rep == `departing` onto the active REPS, balanced.
+
+    Dry-run by default: `apply=False` computes and returns the plan without touching CRM.
+
+    CLOSED leads are moved too (so the departing rep's name disappears from the CRM entirely)
+    but do NOT bump the balance tally — only open leads are real workload, and the seed counts
+    open leads only. Mixing the two would skew the split.
+
+    Idempotent: re-running finds nothing left to move, because the criteria only matches leads
+    still carrying the departing rep's name.
+    """
+    if departing in REPS:
+        raise ValueError(f"{departing!r} is still an ACTIVE rep — remove them from REPS first.")
+    if not REPS:
+        raise ValueError("No active reps to reassign to.")
+
+    await ensure_assigned_rep_field(z)
+    leads = await _search_by_rep(z, departing, fields="id,Last_Name,Company,Pipeline_Stage")
+    await _ensure_seed(z)
+    log.info("reassign_start", departing=departing, found=len(leads), seed=dict(_local_counts), apply=apply)
+
+    plan: dict[str, int] = {rep: 0 for rep in REPS}
+    moved, failed = 0, 0
+    for lead in leads:
+        rep = _pick_rep()
+        is_open = lead.get("Pipeline_Stage") not in CLOSED_STAGES
+        if apply:
+            try:
+                await z.put(
+                    z.crm(f"/{MODULE}/{lead['id']}"),
+                    json={"data": [{ASSIGNED_REP_FIELD: rep}]},
+                    with_org=False,
+                )
+            except ZohoError as exc:
+                log.warning("reassign_failed", lead_id=lead.get("id"), rep=rep, error=str(exc))
+                failed += 1
+                continue
+            await asyncio.sleep(0.15)
+        plan[rep] += 1
+        moved += 1
+        if is_open:
+            _local_counts[rep] = _local_counts.get(rep, 0) + 1
+
+    return {
+        "departing": departing,
+        "found": len(leads),
+        "moved": moved,
+        "failed": failed,
+        "split": plan,
+        "applied": apply,
+        "final_open_counts": dict(_local_counts),
+    }
+
+
 # ── CLI: seed / report / backfill ───────────────────────────────────────────────
 async def _live_counts(z: ZohoClient) -> dict[str, int]:
     return {rep: await _count_open_leads(z, rep) for rep in REPS}
@@ -255,12 +325,29 @@ async def _main() -> None:
     ap = argparse.ArgumentParser(description="Assign CRM leads to reps (Assigned_Rep) + Cliq notify.")
     ap.add_argument("--backfill", action="store_true", help="assign all currently-unassigned leads")
     ap.add_argument("--notify", action="store_true", help="fire a Cliq alert per lead during backfill")
+    ap.add_argument("--reassign-from", metavar="REP",
+                    help="move a departed rep's leads onto the active reps (dry-run unless --apply)")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --reassign-from: actually write to CRM (default is a dry run)")
     args = ap.parse_args()
 
     async with ZohoClient() as z:
         await ensure_assigned_rep_field(z)
         print(f"Field: {ASSIGNED_REP_FIELD} ready.  Cliq webhook: {'SET' if CLIQ_WEBHOOK_URL else 'UNSET (notify skipped)'}")
-        if args.backfill:
+        print(f"Active reps: {', '.join(REPS)}")
+        if args.reassign_from:
+            mode = "APPLYING" if args.apply else "DRY RUN (nothing will be written)"
+            print(f"\nReassigning leads away from {args.reassign_from!r} -> {', '.join(REPS)}  [{mode}]")
+            rep = await reassign_from(z, args.reassign_from, apply=args.apply)
+            print(f"  leads found : {rep['found']}")
+            print(f"  would move  : {rep['moved']}" if not args.apply else f"  moved       : {rep['moved']}")
+            if rep["failed"]:
+                print(f"  FAILED      : {rep['failed']}")
+            print(f"  split       : {rep['split']}")
+            print(f"  open counts after: {rep['final_open_counts']}")
+            if not args.apply:
+                print("\n  Re-run with --apply to commit.")
+        elif args.backfill:
             print("Backfilling unassigned leads (round-robin, balanced)...")
             report = await backfill(z, notify=args.notify)
             print(f"  total={report['total']}  unassigned={report['unassigned']}  assigned={report['assigned']}")
