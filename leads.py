@@ -1,11 +1,11 @@
 """
 leads.py — shared CRM Lead upsert for the lead-source integrations (Shoopy, WhatsApp, …).
 
-ONE place for the dedupe + idempotency + scoring discipline every source reuses:
+ONE place for the dedupe + idempotency discipline every source reuses:
   - idempotency on the source's external id (stored in `Source_Record_Id`)
   - dedupe on mobile (E.164-normalised) then email — same customer => one lead, enriched not duplicated
-  - score via the existing crm_setup.score_lead oracle (mirrors score_lead.dg); assignment is left to
-    the server-side assign_lead.dg workflow (we never call /crm/v6/users — scope-blocked by design)
+  - lead scoring REMOVED 2026-07-23 (see upsert_lead); assignment is round-robin via rep_assignment,
+    balanced by open-lead count — never score-based, and we never call /crm/v6/users (scope-blocked)
   - never hard-deletes; cancellations/deletes flag the lead via a note + Pipeline_Stage
 
 LEADS ONLY — this module never touches invoices or stock.
@@ -19,7 +19,6 @@ from typing import Any
 
 import structlog
 
-from crm_setup import score_label, score_lead
 from zoho_client import ZohoClient
 
 # Optional rep-assignment hook (Assigned_Rep + Cliq notify). Imported defensively so
@@ -173,17 +172,11 @@ async def upsert_lead(
 
     existing, matched_by = await find_lead(z, external_id=external_id, mobile=mobile, email=email)
 
-    # Build the score from the same oracle the Deluge uses.
-    scored = score_lead({
-        "Business_Type": business_type or "",
-        "Estimated_Order_Value": est_value or 0,
-        "City": city or "",
-        "Phone": mobile or "",
-        "Email": email or "",
-        "Product_Interest": product_interest or "",
-        "Company": company or "",
-    })
-
+    # Lead scoring REMOVED (2026-07-23). The K24_Lead_Score rubric never reached the threshold it
+    # gated ("Hot" >= 70; the highest any lead ever scored was 66) and structurally under-scored
+    # channel leads that lack order-value/email (e.g. TailorTalk: 1/107 had an order value). We no
+    # longer compute or write it here. NOTE: the live Zoho "Score Lead" workflow + custom function
+    # must ALSO be disabled in CRM Setup, or Zoho will keep stamping K24_Lead_Score on create/edit.
     stamp = f"[{now_iso()}] {inbound_source}: {note or 'lead event'}"
 
     if existing:
@@ -192,7 +185,7 @@ async def upsert_lead(
         prior_desc = existing.get("Description") or ""
         if external_id and matched_by == "external_id" and note and stamp.split('] ', 1)[1] in prior_desc:
             log.info("lead_noop_duplicate", lead_id=lead_id, external_id=external_id)
-            return {"action": "noop", "lead_id": lead_id, "matched_by": matched_by, "score": int(existing.get("K24_Lead_Score") or 0)}
+            return {"action": "noop", "lead_id": lead_id, "matched_by": matched_by, "score": None}
 
         upd: dict[str, Any] = {"Description": (stamp + "\n" + prior_desc)[:60000]}
         # enrich only empty fields (don't clobber rep edits), but always refresh source + payload + score
@@ -217,18 +210,16 @@ async def upsert_lead(
             upd["Email"] = email
         if stage:
             upd["Pipeline_Stage"] = stage
-        upd["K24_Lead_Score"] = scored["score"]
         await z.put(z.crm(f"/{MODULE}/{lead_id}"), json={"data": [upd]}, with_org=False)
         _cache_put(lead_id, external_id, mobile, email)
-        log.info("lead_updated", lead_id=lead_id, matched_by=matched_by, source=inbound_source, score=scored["score"])
-        return {"action": "updated", "lead_id": lead_id, "matched_by": matched_by, "score": scored["score"]}
+        log.info("lead_updated", lead_id=lead_id, matched_by=matched_by, source=inbound_source)
+        return {"action": "updated", "lead_id": lead_id, "matched_by": matched_by, "score": None}
 
     # create
     payload: dict[str, Any] = {
         "Last_Name": last_name or "Lead",
         "Inbound_Source": inbound_source,
         "Pipeline_Stage": stage or "New",
-        "K24_Lead_Score": scored["score"],
         "Description": stamp,
     }
     if first_name:
@@ -261,7 +252,7 @@ async def upsert_lead(
         raise RuntimeError(f"lead create failed: {rec}")
     lead_id = rec["details"]["id"]
     _cache_put(lead_id, external_id, mobile, email)
-    log.info("lead_created", lead_id=lead_id, source=inbound_source, score=scored["score"], label=score_label(scored["score"]))
+    log.info("lead_created", lead_id=lead_id, source=inbound_source)
 
     # Assign to a rep (balanced round-robin) + notify via Cliq. Best-effort: a failure here
     # must never fail lead ingestion — the lead is already safely created above.
@@ -271,9 +262,9 @@ async def upsert_lead(
             assigned_rep = await rep_assignment.assign_and_notify(z, lead_id, {
                 "name": f"{first_name} {last_name}".strip() if first_name else last_name,
                 "company": company, "phone": mobile, "product": product_interest,
-                "score": scored["score"], "city": city, "source": inbound_source,
+                "score": None, "city": city, "source": inbound_source,
             })
         except Exception as exc:  # noqa: BLE001
             log.warning("assign_notify_failed", lead_id=lead_id, error=str(exc))
 
-    return {"action": "created", "lead_id": lead_id, "matched_by": "none", "score": scored["score"], "assigned_rep": assigned_rep}
+    return {"action": "created", "lead_id": lead_id, "matched_by": "none", "score": None, "assigned_rep": assigned_rep}

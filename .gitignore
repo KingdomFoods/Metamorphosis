@@ -15,6 +15,19 @@ bankfeed_state.json
 demo_state.json
 *_state.json
 
+# ── PII / customer / financial data — NEVER commit (repo is PUBLIC, confirmed 2026-07-24) ──
+# NOTE: patterns must stand ALONE — '#' is a comment only at line start, never inline.
+# data/ = tailortalk_*.csv/json (customer names + phones); *.xlsx = lead lists; hdfc_* = bank stmts.
+data/
+*.xlsx
+*.csv
+*.json
+!package.json
+!.vscode/*.json
+hdfc_*
+kingdom_leads*
+sheet_sync/Code.gs
+
 # Python
 __pycache__/
 *.pyc

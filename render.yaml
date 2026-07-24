@@ -6,11 +6,27 @@
 # (nothing secret is stored in this public repo). Values come from your local
 # metamorphosis/.env — the .com Zoho ones.
 services:
+  # ── Keep-alive cron: pings /health every 10 min so a FREE-tier web service never sleeps and
+  #    never cold-starts a webhook to death. ONLY needed while on the free plan — if the web
+  #    service below is on `starter` (never sleeps) this cron is redundant; delete it then.
+  #    Uses stdlib urllib (no deps). External alternative: an UptimeRobot monitor on /health.
+  - type: cron
+    name: k24-keepalive
+    runtime: python
+    schedule: "*/10 * * * *"     # every 10 minutes (idle sleep kicks in at ~15)
+    region: singapore
+    buildCommand: "true"          # no build needed — stdlib only
+    startCommand: >-
+      python -c "import urllib.request; urllib.request.urlopen('https://metamorphosis-f65d.onrender.com/health', timeout=90)"
+
   - type: web
     name: k24-metamorphosis
     runtime: python
     plan: starter                # free tier SLEEPS after 15 min idle -> cold-start misses
                                   # webhooks; starter (~$7/mo) stays warm. Change if you prefer.
+                                  # NOTE 2026-07-24: the LIVE service is currently on FREE (health
+                                  # cold-started in 42s). Flip it to starter in the dashboard, or
+                                  # rely on the k24-keepalive cron above.
     region: singapore            # closest Render region to India
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
